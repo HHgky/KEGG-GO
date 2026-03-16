@@ -1,0 +1,145 @@
+options(stringsAsFactors = FALSE)
+suppressPackageStartupMessages({
+  library(tools)
+})
+
+# =========================================================
+# 0) 只需要改这里：工作目录 + 你的“原脚本文件名”
+# =========================================================
+work_dir <- "F:/h何昊硕士毕业论文开展/data/DEs分析/WGCNA_results/run_20260227_233721/HubGenes_byTrait"
+core_script <- "A直接出图-标红.R"  # 你的原脚本（不改动）
+setwd(work_dir)
+
+stopifnot(file.exists(core_script))
+
+# =========================================================
+# 1) 自动识别：gene* 为背景；hub* 为目标（按截图命名）
+#    背景：gene_info_<KEY>.csv
+#    目标：hub_<MODULE>_<KEY>.csv
+# =========================================================
+bg_files  <- list.files(work_dir, pattern = "^gene.*\\.csv$", full.names = TRUE)
+hub_files <- list.files(work_dir, pattern = "^hub_.*\\.csv$",  full.names = TRUE)
+
+if (length(bg_files) == 0) stop("未找到 gene*.csv（背景）")
+if (length(hub_files) == 0) stop("未找到 hub_*.csv（目标）")
+
+# 提取 KEY
+bg_key <- file_path_sans_ext(basename(bg_files))
+bg_key <- sub("^gene(_info)?_", "", bg_key)   # 兼容 gene_ / gene_info_
+
+hub_base <- file_path_sans_ext(basename(hub_files))
+hub_module <- sub("^hub_([^_]+)_.*$", "\\1", hub_base)
+hub_key    <- sub("^hub_[^_]+_", "", hub_base)
+
+bg_map <- setNames(bg_files, bg_key)
+
+pair_df <- data.frame(
+  hub_file = hub_files,
+  module   = hub_module,
+  key      = hub_key,
+  bg_file  = unname(bg_map[hub_key]),
+  stringsAsFactors = FALSE
+)
+pair_df <- pair_df[!is.na(pair_df$bg_file), ]
+
+if (nrow(pair_df) == 0) stop("hub 与 gene 按 KEY 无法匹配：请检查命名是否一致")
+
+cat("可匹配任务数：", nrow(pair_df), "\n")
+
+# =========================================================
+# 2) 只取第一列：从 CSV 提取基因ID -> 写成 txt
+# =========================================================
+extract_first_col_ids <- function(csv_file) {
+  df <- read.csv(csv_file, header = FALSE, stringsAsFactors = FALSE, check.names = FALSE)
+  if (ncol(df) < 1) stop("文件没有任何列：", csv_file)
+  ids <- df[[1]]
+  ids <- unique(trimws(as.character(ids)))
+  ids <- ids[!is.na(ids) & ids != ""]
+  # 去掉常见“表头词”（因为 header=FALSE 会把表头当作第一行）
+  drop <- tolower(ids) %in% c("gid","gene","id","gene_id","v1")
+  ids[!drop]
+}
+
+# 修改成绝对路径
+auto_list_dir <- "F:/h何昊硕士毕业论文开展/data/DEs分析/WGCNA_results/run_20260227_233721/HubGenes_byTrait/AUTO_gene_lists"
+dir.create(auto_list_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 设置生成文件的绝对路径
+pair_df$gene_txt <- file.path(auto_list_dir, paste0("TARGET_", pair_df$module, "_", pair_df$key, ".txt"))
+pair_df$bg_txt   <- file.path(auto_list_dir, paste0("BG_", pair_df$key, ".txt"))
+
+for (i in seq_len(nrow(pair_df))) {
+  writeLines(extract_first_col_ids(pair_df$hub_file[i]), pair_df$gene_txt[i])
+  # 同一个 KEY 背景会重复写，覆盖也无所谓（内容一致）
+  writeLines(extract_first_col_ids(pair_df$bg_file[i]),  pair_df$bg_txt[i])
+}
+
+write.table(pair_df, file = file.path(auto_list_dir, "hub_gene_pairs.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# =========================================================
+# 3) 不改核心脚本：为每个 pair 生成一个“临时脚本”并运行
+#    只替换 3 行：gene_file / universe_file / out_dir
+# =========================================================
+core_lines <- readLines(core_script, warn = FALSE)
+
+idx_gene <- grep("^\\s*gene_file\\s*<-", core_lines)[1]
+idx_bg   <- grep("^\\s*universe_file\\s*<-", core_lines)[1]
+idx_out  <- grep("^\\s*out_dir\\s*<-", core_lines)[1]
+
+if (any(is.na(c(idx_gene, idx_bg, idx_out)))) {
+  stop("在核心脚本里找不到 gene_file / universe_file / out_dir 的赋值行，请确认它们以 'xxx <-' 开头。")
+}
+
+run_dir <- file.path(work_dir, "AUTO_runs")
+dir.create(run_dir, showWarnings = FALSE, recursive = TRUE)
+
+summary <- vector("list", nrow(pair_df))
+
+# 遍历每一对文件
+for (i in seq_len(nrow(pair_df))) {
+  tryCatch({
+    key <- pair_df$key[i]
+    module <- pair_df$module[i]
+    
+    # 让核心脚本内部 run_id 继续用当前时间；这里只把 out_dir 名字加上 key/module
+    out_dir_line <- sprintf('out_dir <- file.path(work_dir, paste0("OUT_osa_%s_%s_", run_id))',
+                            key, module)
+    
+    # 使用绝对路径
+    gene_rel <- file.path("F:/h何昊硕士毕业论文开展/data/DEs分析/WGCNA_results/run_20260227_233721/HubGenes_byTrait/AUTO_gene_lists", basename(pair_df$gene_txt[i]))
+    bg_rel   <- file.path("F:/h何昊硕士毕业论文开展/data/DEs分析/WGCNA_results/run_20260227_233721/HubGenes_byTrait/AUTO_gene_lists", basename(pair_df$bg_txt[i]))
+    gene_rel <- gsub("\\\\", "/", gene_rel)
+    bg_rel   <- gsub("\\\\", "/", bg_rel)
+    
+    tmp_lines <- core_lines
+    tmp_lines[idx_gene] <- sprintf('gene_file     <- "%s"', gene_rel)
+    tmp_lines[idx_bg]   <- sprintf('universe_file <- "%s"', bg_rel)
+    tmp_lines[idx_out]  <- out_dir_line
+    
+    tmp_script <- file.path(run_dir, sprintf("run_%s_%s.R", module, key))
+    writeLines(tmp_lines, tmp_script)
+    
+    cat("\n[RUN]", i, "/", nrow(pair_df), " -> ", basename(tmp_script), "\n", sep = "")
+    source(tmp_script, local = new.env(parent = globalenv()))
+    
+    summary[[i]] <- data.frame(
+      module = module,
+      key = key,
+      hub_file = basename(pair_df$hub_file[i]),
+      bg_file  = basename(pair_df$bg_file[i]),
+      tmp_script = basename(tmp_script),
+      stringsAsFactors = FALSE
+    )
+  }, error = function(e) {
+    cat("任务", i, "出错，跳过此任务: ", e$message, "\n")
+  })
+}
+
+summary_df <- do.call(rbind, summary)
+write.table(summary_df, file = file.path(run_dir, "batch_summary.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+cat("\n全部运行完成。\n",
+    "匹配表：", file.path(auto_list_dir, "hub_gene_pairs.tsv"), "\n",
+    "批处理汇总：", file.path(run_dir, "batch_summary.tsv"), "\n", sep = "")

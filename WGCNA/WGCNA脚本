@@ -1,0 +1,685 @@
+
+# ============================================================
+# WGCNA pipeline (featureCounts) - 3 storylines + phenotypes
+# + FJDY 3/6/9 continuous association
+# Output: fixed ROOT dir + timestamp subfolder per run
+# RStudio source() OK + Rscript OK
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(data.table)
+  library(optparse)
+  library(WGCNA)
+})
+
+# ----------------------------
+# 0) RStudio defaults (edit)
+# ----------------------------
+rstudio_mode <- interactive()
+
+counts_file_default <- "F:/h何昊硕士毕业论文开展/data/DEs分析/ALL.gene_counts.txt"
+pheno_file_default  <- "F:/h何昊硕士毕业论文开展/data/DEs分析/A株高表.csv"  # UTF-8 CSV: Material,Diameter,Height
+
+# ✅ 输出根目录（大文件夹根目录）：每次运行会在其下建 run_YYYYmmdd_HHMMSS 子目录
+out_root_default <- "F:/h何昊硕士毕业论文开展/data/DEs分析/WGCNA_results"
+
+threads_default     <- 8
+minGene_default     <- 10000
+maxGene_default     <- 10000
+softPowerAuto_default <- TRUE
+softPower_default   <- 8
+networkType_default <- "unsigned"
+TOMType_default     <- "unsigned"
+minModuleSize_default <- 30
+mergeCutHeight_default <- 0.25
+maxBlockSize_default <- 20000
+lowCount_default    <- 10
+lowCountFrac_default <- 0.2
+
+# ----------------------------
+# 1) CLI options (Rscript)
+# ----------------------------
+option_list <- list(
+  make_option("--counts", type="character", default=""),
+  make_option("--out_root", type="character", default=""),
+  make_option("--pheno", type="character", default=""),
+  make_option("--threads", type="integer", default=threads_default),
+  make_option("--minGene", type="integer", default=minGene_default),
+  make_option("--maxGene", type="integer", default=maxGene_default),
+  make_option("--softPowerAuto", type="character", default=ifelse(softPowerAuto_default, "TRUE", "FALSE")),
+  make_option("--softPower", type="integer", default=softPower_default),
+  make_option("--networkType", type="character", default=networkType_default),
+  make_option("--TOMType", type="character", default=TOMType_default),
+  make_option("--minModuleSize", type="integer", default=minModuleSize_default),
+  make_option("--mergeCutHeight", type="double", default=mergeCutHeight_default),
+  make_option("--maxBlockSize", type="integer", default=maxBlockSize_default),
+  make_option("--lowCount", type="integer", default=lowCount_default),
+  make_option("--lowCountFrac", type="double", default=lowCountFrac_default)
+)
+
+opt <- NULL
+if (rstudio_mode) {
+  opt <- list(
+    counts = counts_file_default,
+    out_root = out_root_default,
+    pheno = pheno_file_default,
+    threads = threads_default,
+    minGene = minGene_default,
+    maxGene = maxGene_default,
+    softPowerAuto = ifelse(softPowerAuto_default, "TRUE", "FALSE"),
+    softPower = softPower_default,
+    networkType = networkType_default,
+    TOMType = TOMType_default,
+    minModuleSize = minModuleSize_default,
+    mergeCutHeight = mergeCutHeight_default,
+    maxBlockSize = maxBlockSize_default,
+    lowCount = lowCount_default,
+    lowCountFrac = lowCountFrac_default
+  )
+} else {
+  opt <- parse_args(OptionParser(option_list = option_list))
+  if (!nzchar(opt$counts))  opt$counts <- counts_file_default
+  if (!nzchar(opt$out_root)) opt$out_root <- out_root_default
+  if (!nzchar(opt$pheno))   opt$pheno <- pheno_file_default
+}
+
+# ----------------------------
+# 2) helpers
+# ----------------------------
+msg <- function(...) cat(format(Sys.time(), "[%F %T] "), sprintf(...), "\n", sep="")
+
+fix_path <- function(x){
+  if (is.null(x) || length(x) == 0 || is.na(x) || x == "") return("")
+  x <- as.character(x)
+  x <- gsub("[\r\n\t]", "", x)
+  x
+}
+
+read_featurecounts <- function(path){
+  msg("Reading featureCounts table: %s", path)
+  dt <- fread(path, data.table = FALSE)
+  if (ncol(dt) <= 6) stop("featureCounts table columns <=6, invalid input.")
+  
+  gene_col <- which(tolower(colnames(dt)) %in% c("geneid","gene_id","geneid."))
+  if (length(gene_col) != 1) gene_col <- 1
+  gene_ids <- dt[[gene_col]]
+  
+  count_df <- dt[, 7:ncol(dt), drop = FALSE]
+  colnames(count_df) <- sub("\\.bam$", "", colnames(count_df))
+  
+  count_mat <- as.matrix(count_df)
+  suppressWarnings(storage.mode(count_mat) <- "integer")
+  rownames(count_mat) <- gene_ids
+  
+  if (any(duplicated(rownames(count_mat)))) {
+    msg("Duplicated Geneid found -> merging by sum.")
+    count_mat <- rowsum(count_mat, group = rownames(count_mat))
+  }
+  
+  count_mat <- count_mat[rowSums(count_mat) > 0, , drop=FALSE]
+  colnames(count_mat) <- make.unique(colnames(count_mat))
+  
+  msg("Counts dim: %d genes x %d samples", nrow(count_mat), ncol(count_mat))
+  count_mat
+}
+
+# sample: Line_Part_Time_Rep, e.g. B48_d_3m_1
+make_traits_from_sample <- function(sample_names){
+  sp <- strsplit(sample_names, "_", fixed = TRUE)
+  mat <- do.call(rbind, lapply(sp, function(x){
+    if (length(x) < 4) c(NA, NA, NA, NA) else x[1:4]
+  }))
+  colnames(mat) <- c("Line","Part","Time","Rep")
+  trait <- as.data.frame(mat, stringsAsFactors = FALSE)
+  rownames(trait) <- sample_names
+  
+  trait$Rep  <- suppressWarnings(as.integer(trait$Rep))
+  trait$Line <- factor(trait$Line)
+  trait$Part <- factor(trait$Part, levels=c("d","m","u"))
+  trait$Time <- factor(trait$Time, levels=c("3m","6m","9m"))
+  
+  mm <- model.matrix(~ 0 + Line + Part + Time, data = trait)
+  mm <- as.data.frame(mm)
+  rownames(mm) <- sample_names
+  
+  cbind(trait, mm)
+}
+
+safe_cor <- function(x, y){
+  x <- as.data.frame(x)
+  y <- as.data.frame(y)
+  x <- x[, sapply(x, is.numeric), drop=FALSE]
+  y <- y[, sapply(y, is.numeric), drop=FALSE]
+  cor(x, y, use="p")
+}
+
+cor_pmatrix_by_traitN <- function(cmat, traitNum){
+  pmat <- matrix(NA_real_, nrow=nrow(cmat), ncol=ncol(cmat))
+  rownames(pmat) <- rownames(cmat)
+  colnames(pmat) <- colnames(cmat)
+  for (j in seq_len(ncol(cmat))) {
+    n_j <- sum(!is.na(traitNum[, j]))
+    pmat[, j] <- corPvalueStudent(cmat[, j], n_j)
+  }
+  pmat
+}
+
+plot_trait_heatmap <- function(MEs, traitNum, prefix){
+  if (is.null(traitNum) || ncol(traitNum) == 0) return(invisible(NULL))
+  cmat <- safe_cor(MEs, traitNum)
+  pmat <- cor_pmatrix_by_traitN(cmat, traitNum)
+  
+  write.csv(cmat, file=paste0(prefix, "_cor.csv"), quote=FALSE)
+  write.csv(pmat, file=paste0(prefix, "_pvalue.csv"), quote=FALSE)
+  
+  textMatrix <- paste(signif(cmat, 2), "\n(", signif(pmat, 1), ")", sep="")
+  dim(textMatrix) <- dim(cmat)
+  
+  pdf(paste0(prefix, "_heatmap.pdf"), width=10, height=8)
+  par(mar=c(6, 10, 3, 3))
+  labeledHeatmap(
+    Matrix = cmat,
+    xLabels = colnames(traitNum),
+    yLabels = colnames(MEs),
+    ySymbols = colnames(MEs),
+    colorLabels = FALSE,
+    colors = blueWhiteRed(50),
+    textMatrix = textMatrix,
+    setStdMargins = FALSE,
+    cex.text = 0.6,
+    zlim = c(-1, 1),
+    main = prefix
+  )
+  dev.off()
+  
+  invisible(list(cor=cmat, p=pmat))
+}
+
+# ----------------------------
+# 3) init output dir (ROOT + timestamp subdir)
+# ----------------------------
+opt$counts   <- fix_path(opt$counts)
+opt$out_root <- fix_path(opt$out_root)
+opt$pheno    <- fix_path(opt$pheno)
+
+if (!nzchar(opt$counts) || !file.exists(opt$counts)) stop("ERROR: counts file not found: ", opt$counts)
+if (!nzchar(opt$out_root)) stop("ERROR: --out_root is empty")
+
+run_tag <- paste0("run_", format(Sys.time(), "%Y%m%d_%H%M%S"))
+run_outdir <- file.path(opt$out_root, run_tag)
+dir.create(run_outdir, showWarnings = FALSE, recursive = TRUE)
+setwd(run_outdir)
+
+msg("Output ROOT dir: %s", opt$out_root)
+msg("This run dir  : %s", run_outdir)
+
+writeLines(c(
+  paste0("counts=", opt$counts),
+  paste0("pheno=", opt$pheno),
+  paste0("out_root=", opt$out_root),
+  paste0("run_outdir=", run_outdir)
+), con="run_info.txt")
+
+enableWGCNAThreads(opt$threads)
+allowWGCNAThreads()
+
+# CRITICAL: avoid BiocGenerics::cor conflict
+cor <- WGCNA::cor
+corPvalueStudent <- WGCNA::corPvalueStudent
+
+# ----------------------------
+# 4) read counts + filter
+# ----------------------------
+count_mat <- read_featurecounts(opt$counts)
+
+min_samples <- max(2, ceiling(ncol(count_mat) * opt$lowCountFrac))
+keep_expr <- rowSums(count_mat >= opt$lowCount) >= min_samples
+count_mat <- count_mat[keep_expr, , drop=FALSE]
+msg("After low-expression filter (count>=%d in >=%d samples): %d genes x %d samples",
+    opt$lowCount, min_samples, nrow(count_mat), ncol(count_mat))
+write.csv(count_mat, file="counts_filtered.csv", quote=FALSE)
+
+# ----------------------------
+# 5) VST + variance selection
+# ----------------------------
+msg("Running DESeq2::vst (blind=TRUE)...")
+coldata <- data.frame(
+  condition = rep("onegroup", ncol(count_mat)),
+  row.names = colnames(count_mat)
+)
+dds <- DESeqDataSetFromMatrix(countData=count_mat, colData=coldata, design=~1)
+vsd <- vst(dds, blind=TRUE)
+expr <- assay(vsd)
+
+gene_var <- apply(expr, 1, var, na.rm=TRUE)
+ord <- order(gene_var, decreasing=TRUE)
+ng <- nrow(expr)
+target_n <- min(max(opt$minGene, min(ng, opt$maxGene)), ng)
+expr <- expr[ord[1:target_n], , drop=FALSE]
+msg("After variance selection: %d genes x %d samples", nrow(expr), ncol(expr))
+
+datExpr <- t(expr)  # samples x genes
+write.csv(datExpr, file="datExpr_WGCNA_input.csv", quote=FALSE)
+
+# ----------------------------
+# 6) QC
+# ----------------------------
+msg("Running goodSamplesGenes...")
+gsg <- goodSamplesGenes(datExpr, verbose=3)
+if (!gsg$allOK) datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+msg("datExpr after QC: %d samples x %d genes", nrow(datExpr), ncol(datExpr))
+
+pdf("01_sampleClustering.pdf", width=12, height=7)
+par(cex=0.6)
+sampleTree <- hclust(dist(datExpr), method="average")
+plot(sampleTree, main="Sample clustering to detect outliers", xlab="", sub="", cex=0.35)
+dev.off()
+
+# ----------------------------
+# 7) traits (auto)
+# ----------------------------
+traitData2 <- make_traits_from_sample(rownames(datExpr))
+write.csv(data.frame(Sample=rownames(traitData2), traitData2),
+          file="traits_auto_full.csv", row.names=FALSE, quote=FALSE)
+
+# ----------------------------
+# 7.5) phenotypes (Height + Diameter) from UTF-8 CSV
+# CSV columns: Material, Diameter, Height ; Material like FJDY_3m_17
+# ----------------------------
+if (nzchar(opt$pheno) && file.exists(opt$pheno)) {
+  msg("Reading phenotype CSV (UTF-8): %s", opt$pheno)
+  ph <- fread(opt$pheno, data.table = FALSE, encoding = "UTF-8")
+  stopifnot(all(c("Material","Diameter","Height") %in% colnames(ph)))
+  
+  ph$PlantID <- as.character(ph$Material)
+  ph$StemDiameter <- as.numeric(ph$Diameter)
+  ph$PlantHeight  <- as.numeric(ph$Height)
+  
+  plant_id_trait <- paste(as.character(traitData2$Line),
+                          as.character(traitData2$Time),
+                          as.integer(traitData2$Rep),
+                          sep="_")
+  
+  traitData2$PlantHeight  <- ph$PlantHeight[match(plant_id_trait, ph$PlantID)]
+  traitData2$StemDiameter <- ph$StemDiameter[match(plant_id_trait, ph$PlantID)]
+  
+  miss_h <- sum(is.na(traitData2$PlantHeight))
+  miss_d <- sum(is.na(traitData2$StemDiameter))
+  msg("Phenotype matched. Missing PlantHeight=%d; Missing StemDiameter=%d", miss_h, miss_d)
+  if (miss_h > 0) {
+    msg("Example missing PlantID (first 10): %s", paste(head(plant_id_trait[is.na(traitData2$PlantHeight)], 10), collapse=", "))
+  }
+} else {
+  msg("WARNING: phenotype file not found, skip: %s", opt$pheno)
+}
+
+# ----------------------------
+# 7.6) FJDY continuous time 3/6/9 (only FJDY has 6m)
+# TimeNum_FJDY / TimeZ_FJDY
+# ----------------------------
+traitData2$TimeNum <- as.numeric(gsub("m","", as.character(traitData2$Time)))
+traitData2$TimeNum_FJDY <- ifelse(as.character(traitData2$Line) == "FJDY", traitData2$TimeNum, NA_real_)
+traitData2$TimeZ_FJDY <- NA_real_
+idx_fjdy <- which(as.character(traitData2$Line) == "FJDY" & !is.na(traitData2$TimeNum))
+if (length(idx_fjdy) >= 3) traitData2$TimeZ_FJDY[idx_fjdy] <- as.numeric(scale(traitData2$TimeNum[idx_fjdy]))
+
+# Remove TimeNum_FJDY column from traitData2 to avoid its display
+# 删除 TimeNum 列
+traitData2$TimeNum <- NULL
+
+# numeric trait matrix，不包含 TimeNum
+traitNum_all <- traitData2[, sapply(traitData2, is.numeric), drop=FALSE]
+# ----------------------------
+# 8) soft threshold
+# ----------------------------
+softPowerAuto <- toupper(opt$softPowerAuto) == "TRUE"
+powers <- 1:20
+msg("Running pickSoftThreshold (networkType=%s)...", opt$networkType)
+sft <- pickSoftThreshold(datExpr, powerVector=powers, networkType=opt$networkType, verbose=5)
+
+beta <- opt$softPower
+if (softPowerAuto && !is.null(sft$powerEstimate) && !is.na(sft$powerEstimate)) beta <- as.integer(sft$powerEstimate)
+msg("Using soft power beta = %d", beta)
+saveRDS(sft, file="pickSoftThreshold.rds")
+
+pdf("02_softThreshold.pdf", width=12, height=5)
+par(mfrow=c(1,2))
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)", ylab="Scale Free Topology Model Fit, signed R^2",
+     type="n", main="Scale independence", ylim=c(-1,1))
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers, cex=0.8, col="red")
+abline(h=0.8, col="red")
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)", ylab="Mean Connectivity",
+     type="n", main="Mean connectivity")
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=0.8, col="red")
+dev.off()
+
+# ----------------------------
+# 9) network + modules
+# ----------------------------
+msg("Running blockwiseModules...")
+net <- blockwiseModules(
+  datExpr,
+  power = beta,
+  networkType = opt$networkType,
+  TOMType = opt$TOMType,
+  minModuleSize = opt$minModuleSize,
+  reassignThreshold = 0,
+  mergeCutHeight = opt$mergeCutHeight,
+  numericLabels = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs = TRUE,
+  saveTOMFileBase = "TOM",
+  maxBlockSize = opt$maxBlockSize,
+  verbose = 3
+)
+
+moduleColors <- labels2colors(net$colors)
+save(net, moduleColors, datExpr, file="WGCNA_network.RData")
+
+pdf("03_dendro_moduleColors.pdf", width=12, height=6)
+plotDendroAndColors(net$dendrograms[[1]],
+                    moduleColors[net$blockGenes[[1]]],
+                    "Module colors",
+                    dendroLabels=FALSE, hang=0.03,
+                    addGuide=TRUE, guideHang=0.05)
+dev.off()
+
+module_assign <- data.frame(Gene=colnames(datExpr), Module=moduleColors, stringsAsFactors=FALSE)
+write.csv(module_assign, file="module_assignment.csv", row.names=FALSE, quote=FALSE)
+
+# ----------------------------
+# 10) MEs + heatmaps
+# ----------------------------
+MEs <- moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs <- orderMEs(MEs)
+write.csv(MEs, file="module_eigengenes.csv", quote=FALSE)
+
+# ALL
+plot_trait_heatmap(MEs, traitNum_all, prefix="ModuleTrait_ALL")
+
+# TIME / PART / LINE
+traitNum_time <- traitNum_all[, grep("^Time", colnames(traitNum_all), value=TRUE), drop=FALSE]
+traitNum_part <- traitNum_all[, grep("^Part", colnames(traitNum_all), value=TRUE), drop=FALSE]
+traitNum_line <- traitNum_all[, grep("^Line", colnames(traitNum_all), value=TRUE), drop=FALSE]
+if (ncol(traitNum_time)>0) plot_trait_heatmap(MEs, traitNum_time, "ModuleTrait_TIME")
+if (ncol(traitNum_part)>0) plot_trait_heatmap(MEs, traitNum_part, "ModuleTrait_PART")
+if (ncol(traitNum_line)>0) plot_trait_heatmap(MEs, traitNum_line, "ModuleTrait_LINE")
+
+# PHENO
+traitNum_pheno <- traitNum_all[, intersect(colnames(traitNum_all), c("PlantHeight","StemDiameter")), drop=FALSE]
+if (ncol(traitNum_pheno)>0) plot_trait_heatmap(MEs, traitNum_pheno, "ModuleTrait_PHENO")
+
+# d部位 + 3m
+traitNum_d3m <- traitNum_all[, intersect(colnames(traitNum_all), c("Partd","Time3m")), drop=FALSE]
+if (ncol(traitNum_d3m)>0) plot_trait_heatmap(MEs, traitNum_d3m, "ModuleTrait_dPart_3m")
+
+# FJDY 连续时间
+traitNum_fjdy <- traitNum_all[, intersect(colnames(traitNum_all), c("TimeNum_FJDY","TimeZ_FJDY")), drop=FALSE]
+if (ncol(traitNum_fjdy)>0) plot_trait_heatmap(MEs, traitNum_fjdy, "ModuleTrait_FJDY_TimeContinuous")
+
+# ----------------------------
+# 11) Hub genes (include PHENO + FJDY continuous)
+# ----------------------------
+msg("Computing kME (signedKME)...")
+datKME <- signedKME(datExpr, MEs, outputColumnName="kME")
+write.csv(datKME, file="all_genes_kME.csv", quote=FALSE)
+
+traits_of_interest <- unique(c(
+  colnames(traitNum_time),
+  colnames(traitNum_part),
+  colnames(traitNum_line),
+  colnames(traitNum_pheno),
+  colnames(traitNum_fjdy)
+))
+
+dir.create("HubGenes_byTrait", showWarnings=FALSE)
+
+for (tr in traits_of_interest) {
+  msg("Hub analysis for trait: %s", tr)
+  if (!tr %in% colnames(traitNum_all)) next
+  trait_vec <- traitNum_all[[tr]]
+  n_eff <- sum(!is.na(trait_vec))
+  if (n_eff < 5) next
+  
+  GS <- as.numeric(cor(datExpr, trait_vec, use="p"))
+  GS_p <- as.numeric(corPvalueStudent(cor(datExpr, trait_vec, use="p"), n_eff))
+  
+  gene_info <- data.frame(
+    Gene = colnames(datExpr),
+    Module = moduleColors,
+    GS = GS,
+    GS_pvalue = GS_p,
+    stringsAsFactors=FALSE
+  )
+  gene_info <- cbind(gene_info, datKME[gene_info$Gene, , drop=FALSE])
+  write.csv(gene_info, file=file.path("HubGenes_byTrait", paste0("gene_info_", tr, ".csv")),
+            row.names=FALSE, quote=FALSE)
+  
+  mods <- sort(unique(moduleColors))
+  for (mod in mods) {
+    if (mod == "grey") next
+    kME_col <- paste0("kME", mod)
+    if (!kME_col %in% colnames(gene_info)) next
+    
+    sub <- gene_info[gene_info$Module == mod, , drop=FALSE]
+    if (nrow(sub) < 10) next
+    
+    hub <- sub[abs(sub[[kME_col]]) > 0.7 & abs(sub$GS) > 0.2 & sub$GS_pvalue < 0.05, , drop=FALSE]
+    hub <- hub[order(-abs(hub[[kME_col]]), -abs(hub$GS)), , drop=FALSE]
+    
+    if (nrow(hub) > 0) {
+      write.csv(hub,
+                file=file.path("HubGenes_byTrait", paste0("hub_", mod, "_", tr, ".csv")),
+                row.names=FALSE, quote=FALSE)
+    }
+  }
+}
+
+# ----------------------------
+# 12) Export genes per module
+# ----------------------------
+dir.create("modules_gene_lists", showWarnings=FALSE)
+for (mod in sort(unique(moduleColors))) {
+  genes <- module_assign$Gene[module_assign$Module == mod]
+  write.table(genes, file=file.path("modules_gene_lists", paste0("module_", mod, "_genes.txt")),
+              row.names=FALSE, col.names=FALSE, quote=FALSE)
+}
+
+msg("All done. Run dir: %s", run_outdir)
+
+
+
+
+# ---- 0) Embed Times New Roman into SVG (最稳：跨软件打开也一致) ----
+suppressPackageStartupMessages({
+  library(showtext)
+  library(systemfonts)
+  library(sysfonts)
+})
+
+# 自动在系统字体里查找“Times New Roman”
+f_reg  <- systemfonts::match_font("Times New Roman", bold = FALSE, italic = FALSE)$path
+f_bold <- systemfonts::match_font("Times New Roman", bold = TRUE,  italic = FALSE)$path
+
+if (is.na(f_reg) || f_reg == "") {
+  stop("Times New Roman not found in system fonts. 请确认系统已安装 Times New Roman 字体。")
+}
+if (is.na(f_bold) || f_bold == "") {
+  # 找不到粗体就退化成常规（仍然是新罗马，但加粗效果可能弱）
+  f_bold <- f_reg
+}
+
+sysfonts::font_add("TNR", regular = f_reg, bold = f_bold)
+showtext_auto(enable = TRUE)
+
+# ---- 1) SVG device helpers (New Roman + Bold) ----
+open_svg <- function(file, width=12, height=7){
+  grDevices::svg(filename = file, width = width, height = height, onefile = TRUE)
+  par(family = "TNR", font = 2)  # 新罗马 + 加粗
+}
+close_dev <- function() dev.off()
+
+# ---- 2) plot style (你觉得字大/小就改这里) ----
+plot_cex   <- 0.90   # 全局字体缩放
+sample_cex <- 0.9   # 样本名（80+样本建议 0.40~0.60）
+mar_sample <- c(12, 4, 3, 2)
+mar_heat   <- c(6, 10, 3, 3)
+
+# ---- 3) Sample clustering (SVG) ----
+open_svg("01_sampleClustering_TNR_Bold.svg", width = 16, height = 7)
+par(cex = plot_cex)
+par(mar = mar_sample)
+sampleTree2 <- hclust(dist(datExpr), method = "average")
+plot(sampleTree2,
+     main = "Sample clustering to detect outliers",
+     xlab = "", sub = "",
+     cex = sample_cex)
+close_dev()
+
+# ---- 4) Soft-threshold (SVG) ----
+if (exists("sft")) {
+  powers <- 1:20
+  open_svg("02_softThreshold_TNR_Bold.svg", width = 14, height = 5)
+  par(cex = 0.90)
+  par(mfrow = c(1,2))
+  
+  plot(sft$fitIndices[,1],
+       -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+       xlab = "Soft Threshold (power)",
+       ylab = "Scale Free Topology Model Fit, signed R^2",
+       type = "n", main = "Scale independence")
+  text(sft$fitIndices[,1],
+       -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+       labels = powers, cex = 0.90, col = "red")
+  abline(h = 0.8, col = "red")
+  
+  plot(sft$fitIndices[,1], sft$fitIndices[,5],
+       xlab = "Soft Threshold (power)",
+       ylab = "Mean Connectivity",
+       type = "n", main = "Mean connectivity")
+  text(sft$fitIndices[,1], sft$fitIndices[,5],
+       labels = powers, cex = 0.90, col = "red")
+  close_dev()
+}
+
+# ---- 5) Dendrogram + module colors (SVG) ----
+if (exists("net") && exists("moduleColors")) {
+  open_svg("03_dendro_moduleColors_TNR_Bold.svg", width = 14, height = 6)
+  par(cex = 0.90)
+  plotDendroAndColors(
+    net$dendrograms[[1]],
+    moduleColors[net$blockGenes[[1]]],
+    "Module colors",
+    dendroLabels = FALSE,
+    hang = 0.03,
+    addGuide = TRUE,
+    guideHang = 0.05
+  )
+  close_dev()
+}
+
+# ---- 6) Module-trait heatmaps (SVG) ----
+plot_trait_heatmap_TNR_Bold <- function(MEs_use, traitNum, prefix){
+  if (is.null(traitNum) || ncol(traitNum) == 0) return(invisible(NULL))
+  
+  cmat <- cor(MEs_use, traitNum, use = "p")
+  pmat <- corPvalueStudent(cmat, nrow(MEs_use))
+  textMatrix <- paste(signif(cmat, 2), "\n(",
+                      signif(pmat, 1), ")", sep = "")
+  dim(textMatrix) <- dim(cmat)
+  
+  open_svg(paste0(prefix, "_TNR_Bold.svg"), width = 11, height = 8)
+  par(cex = 0.95)
+  par(mar = mar_heat)
+  par(family = "TNR", font = 2)  # 再保险一次
+  
+  labeledHeatmap(
+    Matrix = cmat,
+    xLabels = colnames(traitNum),
+    yLabels = colnames(MEs_use),
+    ySymbols = colnames(MEs_use),
+    colorLabels = FALSE,
+    colors = blueWhiteRed(50),
+    textMatrix = textMatrix,
+    setStdMargins = FALSE,
+    cex.text = 0.85,     # 热图格子文字（你嫌小就继续调大）
+    zlim = c(-1, 1),
+    main = prefix
+  )
+  close_dev()
+  
+  invisible(list(cor = cmat, p = pmat))
+}
+
+if (exists("MEs") && exists("traitNum_all"))   plot_trait_heatmap_TNR_Bold(MEs, traitNum_all,   "ModuleTrait_ALL_heatmap")
+if (exists("MEs") && exists("traitNum_time"))  plot_trait_heatmap_TNR_Bold(MEs, traitNum_time,  "ModuleTrait_TIME_heatmap")
+if (exists("MEs") && exists("traitNum_treat")) plot_trait_heatmap_TNR_Bold(MEs, traitNum_treat, "ModuleTrait_TREAT_heatmap")
+if (exists("MEs") && exists("traitNum_line"))  plot_trait_heatmap_TNR_Bold(MEs, traitNum_line,  "ModuleTrait_LINE_heatmap")
+
+# ---- 7) kME vs GS plots (SVG, TopN modules per trait) ----
+TopN <- 10
+kme_dir <- file.path("HubGenes_byTrait", "kME_vs_GS_plots_svg_TNR_Bold")
+dir.create(kme_dir, showWarnings = FALSE, recursive = TRUE)
+
+get_top_modules <- function(trait_name){
+  if (!exists("traitNum_all") || !trait_name %in% colnames(traitNum_all)) return(character(0))
+  v <- as.numeric(cor(MEs, traitNum_all[[trait_name]], use = "p"))
+  names(v) <- colnames(MEs)
+  v <- v[!is.na(v)]
+  names(sort(abs(v), decreasing = TRUE))[1:min(TopN, length(v))]
+}
+
+# ---- 8) 计算与株高（PlantHeight）和茎粗（StemDiameter）的相关性 ----
+GS_plantHeight <- as.numeric(cor(datExpr, traitData2$PlantHeight, use = "p"))
+GS_stemDiameter <- as.numeric(cor(datExpr, traitData2$StemDiameter, use = "p"))
+
+# ---- 9) 生成与PlantHeight和StemDiameter相关的kME vs GS图 ----
+if (exists("datKME") && exists("moduleColors") && exists("traitNum_all")) {
+  traits_interest <- c("PlantHeight", "StemDiameter")
+  
+  for (tr in traits_interest) {
+    topMEs <- get_top_modules(tr)
+    if (length(topMEs) == 0) next
+    
+    GS <- if (tr == "PlantHeight") GS_plantHeight else GS_stemDiameter
+    names(GS) <- colnames(datExpr)
+    
+    for (MEname in topMEs) {
+      mod <- sub("^ME", "", MEname)
+      kME_col <- paste0("kME", mod)
+      if (!kME_col %in% colnames(datKME)) next
+      
+      idx <- which(moduleColors == mod)
+      if (length(idx) < 10) next
+      genes <- colnames(datExpr)[idx]
+      
+      x <- datKME[genes, kME_col]
+      y <- GS[genes]
+      
+      open_svg(file.path(kme_dir, paste0("kMEvsGS_", mod, "_", tr, "_TNR_Bold.svg")),
+               width = 7, height = 6)
+      par(cex = 1.00)
+      par(family = "TNR", font = 2)
+      
+      plot(x, y,
+           xlab = paste0("Module Membership (", kME_col, ")"),
+           ylab = paste0("Gene Significance (", tr, ")"),
+           main = paste0("kME vs GS: ", mod, " / ", tr),
+           pch = 16)
+      abline(v = 0.7, col = "red", lty = 2)
+      abline(v = -0.7, col = "red", lty = 2)
+      abline(h = 0.2, col = "red", lty = 2)
+      abline(h = -0.2, col = "red", lty = 2)
+      legend("topright",
+             legend = paste0("cor=", round(cor(x, y, use = "p"), 3)),
+             bty = "n")
+      close_dev()
+    }
+  }
+}
+
+msg("Extra SVG plots written (Times New Roman Bold embedded): sample clustering + heatmaps + kMEvsGS (TopN=", TopN, ")")

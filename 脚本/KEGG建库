@@ -1,0 +1,296 @@
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(jsonlite)
+  library(readxl)
+  library(tidyr)
+})
+
+# =========================
+# 【修改点 3】先安装再加载 AnnotationForge（否则 library 会报不存在）
+# =========================
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("AnnotationForge", quietly = TRUE)) {
+  BiocManager::install("AnnotationForge", update = FALSE, ask = FALSE)
+}
+library(AnnotationForge)
+
+#设置options
+options(stringsAsFactors = FALSE)
+
+# --- 请在此处修改你的工作路径和文件名 ---
+list.files(pattern = "ROC22")
+work_dir <- "F:/h何昊硕士毕业论文开展/data/KEGG-GO_db"
+json_path <- "F:/h何昊硕士毕业论文开展/data/KEGG-GO_db/osa00001.json" # KEGG JSON文件路径
+raw_file <- "ROC22.egg.emapper.annotations"            # EggNOG结果文件
+
+# 设置工作目录
+setwd(work_dir)
+print(paste("当前工作目录:", getwd()))
+
+# 2.read.delim读取
+emapper_raw <- read.delim(raw_file,
+                          sep = "\t",
+                          quote = "",
+                          comment.char = "#",
+                          stringsAsFactors = FALSE,
+                          header = FALSE)
+cat(paste("读取成功！总行数:", nrow(emapper_raw), "\n"))
+
+# 将第一行的数据提取出来作为列名
+colnames(emapper_raw) <- emapper_raw[1, ]
+
+# 删除第一行
+emapper <- emapper_raw[-1, ]
+
+# 列名 "query", "seed_ortholog", "Preferred_name"
+print("重命名后的列名：")
+print(colnames(emapper))
+
+# 提取需要的数据列
+emapper_final <- emapper[, c(1, 9, 10, 12)]
+colnames(emapper_final) <- c("query", "Preferred_name", "GOs", "KEGG_ko")
+
+emapper <- emapper_final
+
+# 将空值替换为 NA
+emapper[emapper == ""] <- NA
+emapper[emapper == "-"] <- NA
+
+# 检查点
+print(head(emapper))
+
+# ------------------------------------------------------------------
+# 准备 gene_info
+# ------------------------------------------------------------------
+gene_info <- emapper %>%
+  dplyr::select(GID = query, GENENAME = Preferred_name) %>%
+  mutate(GENENAME = ifelse(is.na(GENENAME), GID, GENENAME)) %>%
+  distinct()
+
+cat(paste("Total genes retained:", nrow(gene_info), "\n"))
+
+# ------------------------------------------------------------------
+# 准备 GO 数据
+# ------------------------------------------------------------------
+cat("正在处理 GO 注释...\n")
+gene2go <- emapper %>%
+  dplyr::select(GID = query, GO = GOs) %>%
+  filter(!is.na(GO)) %>%
+  separate_rows(GO, sep = ",") %>%
+  mutate(EVIDENCE = "IEA") %>%
+  distinct()
+
+# ==============================================================================
+# 处理 KEGG 数据
+# ==============================================================================
+cat("正在处理 KEGG 注释...\n")
+
+# 提取基因对应的 KO 号
+gene2ko <- emapper %>%
+  dplyr::select(GID = query, Ko = KEGG_ko) %>%
+  filter(!is.na(Ko)) %>%
+  separate_rows(Ko, sep = ",") %>%
+  mutate(Ko = gsub("ko:", "", Ko)) %>%
+  # =========================
+# 【修改点 4】确保 Ko 变成标准 Kxxxxx，避免后续 join 丢失
+# =========================
+mutate(Ko = str_extract(Ko, "K[0-9]+")) %>%
+  filter(!is.na(Ko)) %>%
+  distinct()
+
+# ==============================================================================
+# 解析 osa00001.json 获取 Pathway 信息（不改 json，只改解析代码适配）
+# ==============================================================================
+get_kegg_info <- function(json_file) {
+  if (!file.exists(json_file)) stop("JSON 文件不存在，请检查路径！")
+  
+  cat("正在读取 JSON 文件 (强制列表模式)...\n")
+  kegg <- fromJSON(json_file, simplifyVector = FALSE)
+  
+  # 检查根节点
+  if (is.null(kegg[["children"]])) stop("JSON 结构异常：找不到根节点 children")
+  cat("JSON 读取成功，根节点名称:", kegg$name, "\n")
+  
+  path_list <- list()
+  ko_list <- list()
+  p_count <- 0
+  
+  children_A <- kegg[["children"]]
+  
+  for (a in seq_along(children_A)) {
+    children_B <- children_A[[a]][["children"]]
+    if (is.null(children_B)) next
+    
+    for (b in seq_along(children_B)) {
+      pathways <- children_B[[b]][["children"]]
+      if (is.null(pathways)) next
+      
+      for (c in seq_along(pathways)) {
+        pathway_node <- pathways[[c]]
+        pathway_info <- pathway_node[["name"]]
+        
+        # =========================
+        # 【修改点 1】适配 osa00010 / ko00010 / ath00010 等，不再写死 ko
+        # =========================
+        pid <- str_extract(pathway_info, "[a-z]{2,4}[0-9]{5}")
+        
+        # =========================
+        # 【修改点 2】清洗 PATH 标签同样改成通用前缀
+        # =========================
+        pname <- str_remove(pathway_info, " \\[PATH:[a-z]{2,4}[0-9]{5}\\]") %>%
+          str_remove("^[0-9]{5} ")
+        
+        if (!is.na(pid) && length(pid) == 1) {
+          p_count <- p_count + 1
+          path_list[[p_count]] <- data.frame(Pathway = pid, Name = pname, stringsAsFactors = FALSE)
+          
+          kos_nodes <- pathway_node[["children"]]
+          if (!is.null(kos_nodes)) {
+            kos_raw <- vapply(kos_nodes, function(x) x[["name"]], FUN.VALUE = character(1))
+            kos <- str_extract(kos_raw, "K[0-9]+")
+            kos <- kos[!is.na(kos)]
+            if (length(kos) > 0) {
+              ko_list[[length(ko_list) + 1]] <- data.frame(Ko = kos, Pathway = pid, stringsAsFactors = FALSE)
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  cat("数据提取完毕，正在合并表格...\n")
+  
+  if (length(path_list) == 0) stop("错误：没有提取到任何 Pathway 信息。说明解析规则未匹配到 PATH ID。")
+  
+  pathway2name <- do.call(rbind, path_list) %>% distinct()
+  
+  if (length(ko_list) == 0) {
+    warning("警告：没有提取到任何 KO 信息。")
+    ko2pathway <- data.frame(Ko = character(), Pathway = character(), stringsAsFactors = FALSE)
+  } else {
+    ko2pathway <- do.call(rbind, ko_list) %>% distinct()
+  }
+  
+  cat(paste("解析成功！提取到", nrow(pathway2name), "条通路，", nrow(ko2pathway), "条 KO 对应关系。\n"))
+  return(list(p2n = pathway2name, k2p = ko2pathway))
+}
+
+# =========================
+# 很重要：如果之前失败生成过 kegg_info.RData（空的），要删掉，否则会一直 load 旧缓存
+# =========================
+if (file.exists("kegg_info.RData")) {
+  cat("检测到 kegg_info.RData，建议删除旧缓存以避免空结果。\n")
+  file.remove("kegg_info.RData")
+}
+
+# 运行调用
+cat("正在解析 JSON 文件 (可能需要几秒钟)...\n")
+kegg_data <- get_kegg_info(json_path)
+pathway2name <- kegg_data$p2n
+ko2pathway <- kegg_data$k2p
+save(pathway2name, ko2pathway, file = "kegg_info.RData")
+
+# 合并生成 gene2pathway
+gene2pathway <- gene2ko %>%
+  inner_join(ko2pathway, by = "Ko") %>%
+  dplyr::select(GID, Pathway) %>%
+  distinct()
+
+# 构建 OrgDb 数据库
+cat("正在构建 OrgDb 包...\n")
+
+tax_id_val <- "1753"
+genus_val <- "Saccharum"
+species_val <- "XTT22"
+
+# 检查数据完整性
+gene2go <- gene2go[gene2go$GID %in% gene_info$GID, ]
+
+# 清洗 GO 列
+gene2go <- gene2go %>%
+  mutate(GO = str_extract(GO, "GO:[0-9]+")) %>%
+  filter(!is.na(GO)) %>%
+  distinct()
+
+cat("清洗后的前几行:\n")
+print(head(gene2go))
+cat("清洗后 GO 记录数:", nrow(gene2go), "\n")
+
+makeOrgPackage(gene_info = gene_info,
+               go = gene2go,
+               version = "0.1",
+               maintainer = 'Cy. <cy150868@163.com>',
+               author = 'Cy. <cy150868@163.com>',
+               outputDir = work_dir,
+               tax_id = tax_id_val,
+               genus = genus_val,
+               species = species_val,
+               goTable = "go")
+
+pkg_name <- paste0("org.", substr(genus_val, 1, 1), species_val, ".eg.db")
+pkg_path <- file.path(work_dir, pkg_name)
+
+cat(paste0("构建完成！包所在路径: ", pkg_path, "\n"))
+
+cat("正在安装 OrgDb 包...\n")
+install.packages(pkg_path, repos = NULL, type = "sources")
+
+library(pkg_name, character.only = TRUE)
+cat("验证数据库...\n")
+print(columns(get(pkg_name)))
+print(paste("数据库中基因总数:", length(keys(get(pkg_name)))))
+
+# 导出 KEGG 背景文件
+cat("正在导出 KEGG 背景文件...\n")
+
+# =========================
+#（小修）清洗 pathway name：BR 标签也改成通用前缀更稳健
+# =========================
+pathway2name$Name <- gsub(" \\[BR:[a-z]{2,4}[0-9]{5}\\]", "", pathway2name$Name)
+pathway2name <- na.omit(pathway2name) %>% distinct()
+
+pathway2gene <- gene2pathway[, c("Pathway", "GID")]
+
+write.table(pathway2name, file = "pathway2name.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(pathway2gene, file = "pathway2gene.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+
+cat("KEGG 富集分析提示: 使用 enricher(gene_list, TERM2GENE = pathway2gene, TERM2NAME = pathway2name)\n")
+
+#大概看看注释质量
+{
+  total_rows <- nrow(emapper)
+  print(paste("EggNOG 表格总行数:", total_rows))
+  
+  total_genes <- length(unique(emapper$query))
+  print(paste("唯一基因 ID 总数:", total_genes))
+  
+  has_go <- emapper %>%
+    filter(!is.na(GOs) & GOs != "-" & GOs != "") %>%
+    dplyr::select(query) %>%
+    distinct() %>%
+    nrow()
+  print(paste("包含 GO 注释的基因数:", has_go))
+  
+  has_ko <- emapper %>%
+    filter(!is.na(KEGG_ko) & KEGG_ko != "-" & KEGG_ko != "") %>%
+    dplyr::select(query) %>%
+    distinct() %>%
+    nrow()
+  print(paste("包含 KEGG KO 注释的基因数:", has_ko))
+  
+  has_name <- emapper %>%
+    filter(!is.na(Preferred_name) & Preferred_name != "-" & Preferred_name != "") %>%
+    dplyr::select(query) %>%
+    distinct() %>%
+    nrow()
+  print(paste("拥有标准基因名 (Preferred_name) 的基因数:", has_name))
+}
+#——————————————————————
+# 将构建好的库用于画图
+#——————————————————————
+# GO：library(org.SXTT22.eg.db)
+# KEGG：
+# pathway2gene <- read.table("./pathway2gene.txt", header = TRUE, sep = "\t")
+# pathway2name <- read.table("./pathway2name.txt", header = TRUE, sep = "\t")
+# enricher(gene_list, TERM2GENE = pathway2gene, TERM2NAME = pathway2name)
